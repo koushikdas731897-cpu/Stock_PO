@@ -153,10 +153,12 @@ def hrp_weights(returns):
     quasi-diagonal ordering -> recursive bisection.
     """
     corr = returns.corr().clip(-1, 1)
-    distance = np.sqrt(np.maximum((1 - corr) / 2, 0))
-    np.fill_diagonal(distance.values, 0)
 
-    condensed = squareform(distance.values, checks=False)
+    # Use a writable NumPy array: DataFrame.values can be read-only.
+    distance = np.sqrt(np.maximum((1 - corr.to_numpy(dtype=float)) / 2, 0))
+    np.fill_diagonal(distance, 0.0)
+
+    condensed = squareform(distance, checks=False)
     link = linkage(condensed, method="single")
     ordered_indices = quasi_diagonal(link)
     ordered_assets = returns.columns[ordered_indices].tolist()
@@ -178,7 +180,13 @@ def hrp_weights(returns):
             left_var = get_cluster_variance(left, cov)
             right_var = get_cluster_variance(right, cov)
 
-            alpha = 1.0 - left_var / (left_var + right_var)
+            variance_sum = left_var + right_var
+            if not np.isfinite(variance_sum) or variance_sum <= 0:
+                alpha = 0.5
+            else:
+                alpha = 1.0 - left_var / variance_sum
+
+            alpha = float(np.clip(alpha, 0.0, 1.0))
             weights[left] *= alpha
             weights[right] *= (1.0 - alpha)
 
