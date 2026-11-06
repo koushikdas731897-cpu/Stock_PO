@@ -1,33 +1,27 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-from datetime import date
 import numpy as np
 import pandas as pd
-import streamlit as st
 import yfinance as yf
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.cluster.hierarchy import linkage
+from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 from scipy.optimize import minimize
+from datetime import date, timedelta
 
 # ------------------------------------------------------------
-# App configuration
+# PAGE CONFIGURATION
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="Nifty 50: MVP vs HRP",
+    page_title="NIFTY 50 | MVP vs HRP Portfolio Optimisation",
     page_icon="📊",
     layout="wide"
 )
 
-START_DATE = "2025-01-01"
-END_DATE_EXCLUSIVE = "2026-11-01"  # Includes data through 30-Oct-2026
-TEST_START = "2026-05-01"
-
-# Top 10 Nifty 50 constituents by index weight, using 30-Sep-2026
-# published constituent weights as the reference selection date.
-DEFAULT_TICKERS = {
+DEFAULT_STOCKS = {
     "HDFC Bank": "HDFCBANK.NS",
     "ICICI Bank": "ICICIBANK.NS",
     "Reliance Industries": "RELIANCE.NS",
@@ -39,520 +33,352 @@ DEFAULT_TICKERS = {
     "Kotak Mahindra Bank": "KOTAKBANK.NS",
     "Mahindra & Mahindra": "M&M.NS",
 }
-
 TRADING_DAYS = 252
 
-
 # ------------------------------------------------------------
-# Market data: ONLY the unadjusted "Close" field is selected
+# DATA DOWNLOAD: RAW CLOSE PRICES ONLY
 # ------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_close_prices(tickers, start_date, end_date):
-    raw = yf.download(
+    data = yf.download(
         tickers=list(tickers),
         start=start_date,
         end=end_date,
+        interval="1d",
         auto_adjust=False,
         actions=False,
-        progress=False,
         group_by="column",
+        progress=False,
         threads=True
     )
+    if data is None or data.empty:
+        raise ValueError("Yahoo Finance returned no data for the selected dates. Check the dates or try again later.")
 
-    if raw.empty:
-        raise ValueError("Yahoo Finance returned no price data.")
-
-    # With multiple tickers, yfinance normally returns MultiIndex columns.
-    if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" not in raw.columns.get_level_values(0):
-            raise ValueError('The downloaded data does not contain a "Close" field.')
-        close = raw["Close"].copy()
+    if isinstance(data.columns, pd.MultiIndex):
+        # yfinance commonly returns (Price, Ticker). Handle either level order.
+        if "Close" in data.columns.get_level_values(0):
+            close = data.xs("Close", axis=1, level=0).copy()
+        elif "Close" in data.columns.get_level_values(1):
+            close = data.xs("Close", axis=1, level=1).copy()
+        else:
+            raise ValueError("The downloaded data does not contain a Close column.")
     else:
-        # Defensive handling if the provider returns a single-level frame.
-        if "Close" not in raw.columns:
-            raise ValueError('The downloaded data does not contain a "Close" field.')
-        close = raw[["Close"]].copy()
+        if "Close" not in data.columns:
+            raise ValueError("The downloaded data does not contain a Close column.")
+        close = data[["Close"]].copy()
         if len(tickers) == 1:
-            close.columns = [tickers[0]]
+            close.columns = list(tickers)
 
     if isinstance(close, pd.Series):
         close = close.to_frame(name=list(tickers)[0])
 
-    # Retain requested ticker order and remove unusable columns/rows.
     available = [ticker for ticker in tickers if ticker in close.columns]
-    close = close[available].apply(pd.to_numeric, errors="coerce")
-    close = close.dropna(axis=1, how="all").dropna(how="all")
-    return close
-
+    close = close.loc[:, available].copy()
+    close = close.apply(pd.to_numeric, errors="coerce")
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    return close.dropna(how="all")
 
 # ------------------------------------------------------------
-# Portfolio optimisation methods
+# PORTFOLIO CONSTRUCTION
 # ------------------------------------------------------------
-def minimum_variance_weights(returns):
-    """Long-only global minimum-variance portfolio, estimated in-sample."""
-    cov = returns.cov().values
-    n = cov.shape[0]
+def calculate_mvp(train_returns):
+    cov = train_returns.cov() * TRADING_DAYS
+    n_assets = len(train_returns.columns)
+    initial = np.repeat(1.0 / n_assets, n_assets)
 
-    def portfolio_variance(weights):
-        return float(weights @ cov @ weights)
+    def objective(weights):
+        return float(weights.T @ cov.to_numpy(copy=True) @ weights)
 
+    constraints = [{"type": "eq", "fun": lambda weights: np.sum(weights) - 1.0}]
+    bounds = tuple((0.0, 1.0) for _ in range(n_assets))
     result = minimize(
-        portfolio_variance,
-        x0=np.repeat(1 / n, n),
-        method="SLSQP",
-        bounds=[(0.0, 1.0)] * n,
-        constraints=[{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}],
-        options={"maxiter": 2000, "ftol": 1e-12}
+        objective, initial, method="SLSQP", bounds=bounds,
+        constraints=constraints, options={"maxiter": 2000, "ftol": 1e-12}
     )
-
     if not result.success:
         raise RuntimeError(f"MVP optimisation failed: {result.message}")
-
-    weights = np.clip(result.x, 0, 1)
-    return pd.Series(weights / weights.sum(), index=returns.columns, name="MVP")
-
-
-def get_cluster_variance(cluster_items, cov):
-    """Compute the variance of an inverse-variance-weighted cluster."""
-    sub_cov = cov.loc[cluster_items, cluster_items]
-    diagonal = np.diag(sub_cov.values)
-    inv_variance = 1.0 / np.maximum(diagonal, 1e-12)
-    cluster_weights = inv_variance / inv_variance.sum()
-    return float(cluster_weights @ sub_cov.values @ cluster_weights)
+    weights = pd.Series(result.x, index=train_returns.columns, name="MVP")
+    weights[weights.abs() < 1e-8] = 0.0
+    return weights / weights.sum()
 
 
-def quasi_diagonal(linkage_matrix):
-    """Return asset indices ordered by hierarchical clustering."""
-    link = linkage_matrix.astype(int)
-    sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
+def calculate_hrp(train_returns):
+    covariance = train_returns.cov()
+    correlation = train_returns.corr().clip(-1, 1)
+    distance = np.sqrt(((1.0 - correlation) / 2.0).clip(lower=0.0))
+    distance_values = distance.to_numpy(copy=True)
+    np.fill_diagonal(distance_values, 0.0)
+    condensed = squareform(distance_values, checks=False)
+    tree = linkage(condensed, method="single", optimal_ordering=True)
+    order = leaves_list(tree).astype(int).tolist()
+    ordered_assets = train_returns.columns[order].tolist()
 
-    num_items = link[-1, 3]
-    while sort_ix.max() >= num_items:
-        sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
-        clusters = sort_ix[sort_ix >= num_items]
-        if clusters.empty:
-            break
-
-        cluster_indices = clusters.index
-        cluster_values = clusters.values - num_items
-        sort_ix[cluster_indices] = link[cluster_values, 0]
-        new_values = pd.Series(
-            link[cluster_values, 1],
-            index=cluster_indices + 1
-        )
-        sort_ix = pd.concat([sort_ix, new_values]).sort_index()
-        sort_ix.index = range(sort_ix.shape[0])
-
-    return sort_ix.astype(int).tolist()
-
-
-def hrp_weights(returns):
-    """
-    Hierarchical Risk Parity:
-    correlation distance -> hierarchical clustering ->
-    quasi-diagonal ordering -> recursive bisection.
-    """
-    corr = returns.corr().clip(-1, 1)
-
-    # Use a writable NumPy array: DataFrame.values can be read-only.
-    distance = np.sqrt(np.maximum((1 - corr.to_numpy(dtype=float)) / 2, 0))
-    np.fill_diagonal(distance, 0.0)
-
-    condensed = squareform(distance, checks=False)
-    link = linkage(condensed, method="single")
-    ordered_indices = quasi_diagonal(link)
-    ordered_assets = returns.columns[ordered_indices].tolist()
-
-    cov = returns.cov()
     weights = pd.Series(1.0, index=ordered_assets)
-    clusters = [ordered_assets]
 
+    def cluster_variance(items):
+        block = covariance.loc[items, items].to_numpy(copy=True)
+        diagonal = np.diag(block)
+        diagonal = np.where(diagonal <= 0, 1e-12, diagonal)
+        inv_var = 1.0 / diagonal
+        cluster_weights = inv_var / inv_var.sum()
+        return float(cluster_weights @ block @ cluster_weights)
+
+    clusters = [ordered_assets]
     while clusters:
         next_clusters = []
         for cluster in clusters:
             if len(cluster) <= 1:
                 continue
-
             split = len(cluster) // 2
-            left = cluster[:split]
-            right = cluster[split:]
-
-            left_var = get_cluster_variance(left, cov)
-            right_var = get_cluster_variance(right, cov)
-
-            variance_sum = left_var + right_var
-            if not np.isfinite(variance_sum) or variance_sum <= 0:
-                alpha = 0.5
-            else:
-                alpha = 1.0 - left_var / variance_sum
-
-            alpha = float(np.clip(alpha, 0.0, 1.0))
-            weights[left] *= alpha
-            weights[right] *= (1.0 - alpha)
-
+            left, right = cluster[:split], cluster[split:]
+            left_var, right_var = cluster_variance(left), cluster_variance(right)
+            total_var = left_var + right_var
+            left_weight = 0.5 if total_var <= 0 else 1.0 - left_var / total_var
+            weights[left] *= left_weight
+            weights[right] *= (1.0 - left_weight)
             next_clusters.extend([left, right])
         clusters = next_clusters
 
-    weights = weights.reindex(returns.columns).fillna(0)
-    weights = weights / weights.sum()
-    weights.name = "HRP"
-    return weights
-
+    weights = weights.reindex(train_returns.columns).fillna(0.0)
+    weights[weights < 1e-10] = 0.0
+    if not np.isfinite(weights.sum()) or weights.sum() <= 0:
+        raise ValueError("HRP could not produce valid portfolio weights.")
+    return weights / weights.sum(), tree, correlation
 
 # ------------------------------------------------------------
-# Performance calculations
+# BACKTEST METRICS
 # ------------------------------------------------------------
-def portfolio_daily_returns(asset_returns, weights):
-    return asset_returns @ weights.reindex(asset_returns.columns)
-
-
-def performance_metrics(daily_returns, annual_risk_free_rate):
-    r = daily_returns.dropna()
-    if len(r) < 2:
-        return {
-            "Total Return": np.nan,
-            "Annualised Return (CAGR)": np.nan,
-            "Annualised Volatility": np.nan,
-            "Sharpe Ratio": np.nan,
-        }
-
-    wealth = (1 + r).cumprod()
-    total_return = wealth.iloc[-1] - 1
-    cagr = wealth.iloc[-1] ** (TRADING_DAYS / len(r)) - 1
-    volatility = r.std(ddof=1) * np.sqrt(TRADING_DAYS)
-    daily_rf = annual_risk_free_rate / TRADING_DAYS
-    sharpe = (
-        (r.mean() - daily_rf) * TRADING_DAYS ** 0.5 / r.std(ddof=1)
-        if r.std(ddof=1) > 0 else np.nan
-    )
-    return {
+def evaluate_strategy(test_returns, weights, risk_free_rate):
+    daily = (test_returns @ weights).dropna()
+    if len(daily) < 2:
+        raise ValueError("Not enough test-period observations to calculate performance.")
+    wealth = (1.0 + daily).cumprod()
+    total_return = float(wealth.iloc[-1] - 1.0)
+    annual_return = float(wealth.iloc[-1] ** (TRADING_DAYS / len(daily)) - 1.0)
+    annual_risk = float(daily.std(ddof=1) * np.sqrt(TRADING_DAYS))
+    annual_mean = float(daily.mean() * TRADING_DAYS)
+    sharpe = (annual_mean - risk_free_rate) / annual_risk if annual_risk > 0 else np.nan
+    drawdown = wealth / wealth.cummax() - 1.0
+    metrics = {
         "Total Return": total_return,
-        "Annualised Return (CAGR)": cagr,
-        "Annualised Volatility": volatility,
-        "Sharpe Ratio": sharpe,
+        "Annualised Return": annual_return,
+        "Annualised Risk": annual_risk,
+        "Sharpe Ratio": float(sharpe) if np.isfinite(sharpe) else np.nan,
+        "Maximum Drawdown": float(drawdown.min()),
     }
+    return metrics, daily, wealth, drawdown
 
 
-def drawdown_series(daily_returns):
-    wealth = (1 + daily_returns).cumprod()
-    return wealth / wealth.cummax() - 1
-
-
-def format_metrics_table(metrics):
-    frame = pd.DataFrame(metrics).T
-    for col in ["Total Return", "Annualised Return (CAGR)", "Annualised Volatility"]:
-        frame[col] = frame[col].map(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
-    frame["Sharpe Ratio"] = frame["Sharpe Ratio"].map(
-        lambda x: f"{x:.3f}" if pd.notna(x) else "N/A"
-    )
-    return frame
-
+def as_percent(value):
+    return f"{value:.2%}" if pd.notna(value) else "N/A"
 
 # ------------------------------------------------------------
-# Streamlit interface
+# SIDEBAR: EDITABLE DATE RANGES
 # ------------------------------------------------------------
-st.title("📊 Nifty 50 Portfolio Optimisation")
-st.subheader("Minimum Variance Portfolio (MVP) vs Hierarchical Risk Parity (HRP)")
-st.caption(
-    "Uses daily NSE-listed stock Close prices from Yahoo Finance. "
-    "This is an educational historical backtest, not investment advice."
+st.sidebar.title("Model settings")
+st.sidebar.subheader("Training period")
+training_start = st.sidebar.date_input("Training start", value=date(2025, 1, 1), key="training_start")
+training_end = st.sidebar.date_input("Training end", value=date(2026, 4, 30), key="training_end")
+st.sidebar.markdown("---")
+st.sidebar.subheader("Testing period")
+testing_start = st.sidebar.date_input("Testing start", value=date(2026, 5, 1), key="testing_start")
+testing_end = st.sidebar.date_input("Testing end", value=date(2026, 10, 31), key="testing_end")
+st.sidebar.markdown("---")
+risk_free_pct = st.sidebar.number_input(
+    "Annual risk-free rate (%)", min_value=0.0, max_value=20.0,
+    value=6.0, step=0.25,
+    help="Assumption used to calculate the annualised Sharpe ratio."
 )
+risk_free_rate = risk_free_pct / 100.0
+st.sidebar.caption("Prices are downloaded from Yahoo Finance. The analysis uses only the daily Close field.")
+st.sidebar.caption("Default universe: 10 large NIFTY 50 constituents. Tickers can be changed in DEFAULT_STOCKS in the source code.")
 
-with st.sidebar:
-    st.header("Settings")
-    st.write("**Historical period:** 01-Jan-2025 to 30-Oct-2026")
-    st.write("**Training period:** 01-Jan-2025 to 30-Apr-2026")
-    st.write("**Out-of-sample test:** 01-May-2026 to 30-Oct-2026")
+# ------------------------------------------------------------
+# MAIN PAGE
+# ------------------------------------------------------------
+st.title("NIFTY 50 Portfolio Optimisation")
+st.subheader("Minimum Variance Portfolio (MVP) vs Hierarchical Risk Parity (HRP)")
+st.caption("Daily Close-price analysis | Build portfolios on the training period | Evaluate on the separate testing period")
 
-    annual_rf = st.number_input(
-        "Annual risk-free rate (%)",
-        min_value=0.0,
-        max_value=20.0,
-        value=6.0,
-        step=0.25,
-        help="Used only for Sharpe ratio calculation. Change this to your chosen Indian risk-free proxy."
-    ) / 100
+st.markdown("### Portfolio optimisation and backtesting")
+run_clicked = st.button("Run Portfolio Optimization", type="primary", use_container_width=False)
 
-    st.markdown("---")
-    st.markdown("**Stock universe**")
-    st.caption(
-        "Default list: 10 highest-weight Nifty 50 constituents as of "
-        "30-Sep-2026. You can edit the Yahoo Finance symbols below."
-    )
-    ticker_text = st.text_area(
-        "Yahoo Finance tickers (one per line)",
-        value="\n".join(DEFAULT_TICKERS.values()),
-        height=220
-    )
-    run_button = st.button("Run portfolio analysis", type="primary", use_container_width=True)
+if run_clicked:
+    if training_start >= training_end:
+        st.error("Training start date must be earlier than training end date.")
+        st.stop()
+    if testing_start >= testing_end:
+        st.error("Testing start date must be earlier than testing end date.")
+        st.stop()
+    if testing_start <= training_end:
+        st.error("The testing period must start after the training period ends. Keep the periods separate to avoid data leakage.")
+        st.stop()
 
-tickers = [x.strip().upper() for x in ticker_text.splitlines() if x.strip()]
-tickers = list(dict.fromkeys(tickers))
+    tickers = list(DEFAULT_STOCKS.values())
+    download_start = training_start.isoformat()
+    # yfinance end is exclusive, so add one day to include the selected test-end date.
+    download_end = (testing_end + timedelta(days=1)).isoformat()
 
-if not tickers:
-    st.error("Enter at least two valid Yahoo Finance tickers.")
-    st.stop()
-
-if len(tickers) < 2:
-    st.error("At least two tickers are required for portfolio optimisation.")
-    st.stop()
-
-if run_button or "analysis_has_run" not in st.session_state:
-    st.session_state.analysis_has_run = True
-
-if st.session_state.analysis_has_run:
     try:
-        with st.spinner("Downloading Close prices and calculating portfolio weights..."):
-            close = download_close_prices(
-                tickers,
-                START_DATE,
-                END_DATE_EXCLUSIVE
-            )
+        with st.spinner("Downloading daily Close prices and building the portfolios..."):
+            close_prices = download_close_prices(tickers, download_start, download_end)
 
-            missing = sorted(set(tickers) - set(close.columns))
-            if missing:
-                st.warning(
-                    "No usable Close-price series was returned for: "
-                    + ", ".join(missing)
-                )
+        missing = [ticker for ticker in tickers if ticker not in close_prices.columns]
+        if missing:
+            st.warning("Not returned by Yahoo Finance and excluded: " + ", ".join(missing))
 
-            # Require complete price history for a fair, common comparison.
-            close = close.dropna(axis=1, how="any")
-            if close.shape[1] < 2:
-                raise ValueError(
-                    "Fewer than two tickers have complete data for the full period. "
-                    "Check ticker symbols or use stocks with complete histories."
-                )
+        # Keep a common complete price history so both methods use the same assets.
+        usable = close_prices.dropna(axis=1, how="any").copy()
+        excluded = sorted(set(close_prices.columns) - set(usable.columns))
+        if excluded:
+            st.warning("Excluded because of missing prices in the selected date range: " + ", ".join(excluded))
+        if usable.shape[1] < 2:
+            raise ValueError("Fewer than two complete stock price series are available for the selected dates.")
 
-            close = close.loc[
-                (close.index >= pd.Timestamp(START_DATE)) &
-                (close.index < pd.Timestamp(END_DATE_EXCLUSIVE))
-            ].sort_index()
+        daily_returns = usable.pct_change(fill_method=None).dropna(how="all")
+        train_returns = daily_returns.loc[training_start:training_end].dropna()
+        test_returns = daily_returns.loc[testing_start:testing_end].dropna()
+        common = [col for col in train_returns.columns if col in test_returns.columns]
+        train_returns = train_returns[common].dropna()
+        test_returns = test_returns[common].dropna()
+        if len(common) < 2:
+            raise ValueError("Fewer than two stocks have valid data in both periods.")
+        if train_returns.empty or test_returns.empty:
+            raise ValueError("Training or testing returns are empty. Check the selected dates and data availability.")
 
-            asset_returns = close.pct_change().dropna(how="any")
-            train_returns = asset_returns.loc[asset_returns.index < pd.Timestamp(TEST_START)]
-            test_returns = asset_returns.loc[asset_returns.index >= pd.Timestamp(TEST_START)]
+        mvp_weights = calculate_mvp(train_returns)
+        hrp_weights, linkage_matrix, correlation = calculate_hrp(train_returns)
+        mvp_metrics, mvp_daily, mvp_wealth, mvp_drawdown = evaluate_strategy(test_returns, mvp_weights, risk_free_rate)
+        hrp_metrics, hrp_daily, hrp_wealth, hrp_drawdown = evaluate_strategy(test_returns, hrp_weights, risk_free_rate)
 
-            if train_returns.empty or test_returns.empty:
-                raise ValueError(
-                    "Training or testing data is empty. Check the available date range."
-                )
+        company_by_ticker = {ticker: company for company, ticker in DEFAULT_STOCKS.items()}
+        allocation_df = pd.DataFrame({
+            "Company": [company_by_ticker[t] for t in common],
+            "Ticker": common,
+            "MVP Weight": [float(mvp_weights[t]) for t in common],
+            "HRP Weight": [float(hrp_weights[t]) for t in common],
+        })
+        allocation_df["MVP Allocation (%)"] = allocation_df["MVP Weight"] * 100
+        allocation_df["HRP Allocation (%)"] = allocation_df["HRP Weight"] * 100
 
-            if len(train_returns) < 60 or len(test_returns) < 20:
-                raise ValueError(
-                    "Insufficient observations. Need at least 60 training and "
-                    "20 testing daily return observations."
-                )
+        metrics_df = pd.DataFrame({"MVP": mvp_metrics, "HRP": hrp_metrics}).T
+        backtest_df = metrics_df.copy()
+        backtest_df.insert(0, "Strategy", backtest_df.index)
+        backtest_df.index = range(len(backtest_df))
+        daily_df = pd.DataFrame({"MVP": mvp_daily, "HRP": hrp_daily})
+        wealth_df = pd.DataFrame({"MVP": mvp_wealth, "HRP": hrp_wealth})
+        drawdown_df = pd.DataFrame({"MVP": mvp_drawdown, "HRP": hrp_drawdown})
 
-            # Estimate weights using training data only.
-            mvp_w = minimum_variance_weights(train_returns)
-            hrp_w = hrp_weights(train_returns)
-
-            weights = pd.DataFrame({
-                "MVP": mvp_w,
-                "HRP": hrp_w
-            }).fillna(0)
-
-            # Apply fixed, training-estimated weights to the untouched test set.
-            test_portfolios = pd.DataFrame({
-                "MVP": portfolio_daily_returns(test_returns, mvp_w),
-                "HRP": portfolio_daily_returns(test_returns, hrp_w)
-            })
-
-            # Training performance is included for context, not as test results.
-            train_portfolios = pd.DataFrame({
-                "MVP": portfolio_daily_returns(train_returns, mvp_w),
-                "HRP": portfolio_daily_returns(train_returns, hrp_w)
-            })
-
-        st.success(
-            f"Analysis complete. {len(close.columns)} stocks included; "
-            f"{len(train_returns)} training days and {len(test_returns)} testing days."
-        )
-
-        st.info(
-            "Methodology: portfolio weights are estimated only from the training period "
-            "(Jan-2025 to Apr-2026), then held fixed during the test period "
-            "(May-2026 to Oct-2026). No test-period returns are used to optimise weights."
-        )
-
-        # -------------------- Test metrics --------------------
-        st.header("1. Out-of-sample performance — test period")
-        test_metrics = {
-            "MVP": performance_metrics(test_portfolios["MVP"], annual_rf),
-            "HRP": performance_metrics(test_portfolios["HRP"], annual_rf),
+        st.session_state["portfolio_results"] = {
+            "close_prices": usable,
+            "allocation_df": allocation_df,
+            "metrics_df": metrics_df,
+            "backtest_df": backtest_df,
+            "daily_df": daily_df,
+            "wealth_df": wealth_df,
+            "drawdown_df": drawdown_df,
+            "correlation": correlation,
+            "stocks": len(common),
+            "train_obs": len(train_returns),
+            "test_obs": len(test_returns),
+            "training_start": training_start,
+            "training_end": training_end,
+            "testing_start": testing_start,
+            "testing_end": testing_end,
         }
-        metric_table = format_metrics_table(test_metrics)
-        st.dataframe(metric_table, use_container_width=True)
-
-        c1, c2, c3, c4 = st.columns(4)
-        mvp_m = test_metrics["MVP"]
-        hrp_m = test_metrics["HRP"]
-        c1.metric("MVP test return", f"{mvp_m['Total Return']:.2%}")
-        c2.metric("HRP test return", f"{hrp_m['Total Return']:.2%}")
-        c3.metric("MVP Sharpe", f"{mvp_m['Sharpe Ratio']:.3f}")
-        c4.metric("HRP Sharpe", f"{hrp_m['Sharpe Ratio']:.3f}")
-
-        # -------------------- Cumulative performance --------------------
-        st.header("2. Growth of ₹1 during the test period")
-        growth = (1 + test_portfolios).cumprod()
-        growth.index.name = "Date"
-        growth_long = growth.reset_index().melt(
-            id_vars="Date", var_name="Strategy", value_name="Portfolio value"
-        )
-        fig_growth = px.line(
-            growth_long,
-            x="Date",
-            y="Portfolio value",
-            color="Strategy",
-            title="Out-of-sample cumulative portfolio value"
-        )
-        fig_growth.update_layout(legend_title_text="", hovermode="x unified")
-        st.plotly_chart(fig_growth, use_container_width=True)
-
-        # -------------------- Risk / drawdown --------------------
-        st.header("3. Risk and drawdown")
-        risk_col1, risk_col2 = st.columns(2)
-
-        with risk_col1:
-            rolling_vol = test_portfolios.rolling(21).std() * np.sqrt(TRADING_DAYS)
-            vol_long = rolling_vol.reset_index().melt(
-                id_vars="Date", var_name="Strategy", value_name="Annualised volatility"
-            )
-            fig_vol = px.line(
-                vol_long,
-                x="Date",
-                y="Annualised volatility",
-                color="Strategy",
-                title="21-trading-day rolling annualised volatility"
-            )
-            st.plotly_chart(fig_vol, use_container_width=True)
-
-        with risk_col2:
-            dd = pd.DataFrame({
-                "MVP": drawdown_series(test_portfolios["MVP"]),
-                "HRP": drawdown_series(test_portfolios["HRP"])
-            })
-            dd_long = dd.reset_index().melt(
-                id_vars="Date", var_name="Strategy", value_name="Drawdown"
-            )
-            fig_dd = px.area(
-                dd_long,
-                x="Date",
-                y="Drawdown",
-                color="Strategy",
-                title="Test-period drawdown"
-            )
-            st.plotly_chart(fig_dd, use_container_width=True)
-
-        # -------------------- Allocation pies and table --------------------
-        st.header("4. Portfolio allocations")
-        alloc_col1, alloc_col2 = st.columns(2)
-
-        with alloc_col1:
-            mvp_alloc = weights["MVP"].sort_values(ascending=False).reset_index()
-            mvp_alloc.columns = ["Stock", "Weight"]
-            fig_mvp = px.pie(
-                mvp_alloc,
-                names="Stock",
-                values="Weight",
-                title="MVP allocation",
-                hole=0.25
-            )
-            fig_mvp.update_traces(textposition="inside", textinfo="label+percent")
-            st.plotly_chart(fig_mvp, use_container_width=True)
-
-        with alloc_col2:
-            hrp_alloc = weights["HRP"].sort_values(ascending=False).reset_index()
-            hrp_alloc.columns = ["Stock", "Weight"]
-            fig_hrp = px.pie(
-                hrp_alloc,
-                names="Stock",
-                values="Weight",
-                title="HRP allocation",
-                hole=0.25
-            )
-            fig_hrp.update_traces(textposition="inside", textinfo="label+percent")
-            st.plotly_chart(fig_hrp, use_container_width=True)
-
-        allocation_table = weights.copy()
-        allocation_table["MVP"] = allocation_table["MVP"].map(lambda x: f"{x:.2%}")
-        allocation_table["HRP"] = allocation_table["HRP"].map(lambda x: f"{x:.2%}")
-        allocation_table.index.name = "Stock"
-        st.subheader("Allocation comparison table")
-        st.dataframe(allocation_table, use_container_width=True)
-
-        # -------------------- Training / test comparison --------------------
-        st.header("5. Training vs testing performance")
-        train_metrics = {
-            "MVP": performance_metrics(train_portfolios["MVP"], annual_rf),
-            "HRP": performance_metrics(train_portfolios["HRP"], annual_rf),
-        }
-        compare = {}
-        for strategy in ["MVP", "HRP"]:
-            compare[f"{strategy} — Training"] = train_metrics[strategy]
-            compare[f"{strategy} — Testing"] = test_metrics[strategy]
-        st.dataframe(format_metrics_table(compare), use_container_width=True)
-
-        # -------------------- Correlation matrix --------------------
-        st.header("6. Training-period correlation matrix")
-        corr = train_returns.corr()
-        fig_corr = px.imshow(
-            corr,
-            text_auto=".2f",
-            aspect="auto",
-            color_continuous_scale="RdBu_r",
-            zmin=-1,
-            zmax=1,
-            title="Asset return correlations (training data only)"
-        )
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-        # -------------------- Downloadable outputs --------------------
-        st.header("7. Download results")
-        weights_csv = weights.to_csv().encode("utf-8")
-        test_csv = test_portfolios.to_csv().encode("utf-8")
-        close_csv = close.to_csv().encode("utf-8")
-        d1, d2, d3 = st.columns(3)
-        d1.download_button(
-            "Download allocation table (CSV)",
-            data=weights_csv,
-            file_name="mvp_hrp_allocations.csv",
-            mime="text/csv"
-        )
-        d2.download_button(
-            "Download test returns (CSV)",
-            data=test_csv,
-            file_name="mvp_hrp_test_returns.csv",
-            mime="text/csv"
-        )
-        d3.download_button(
-            "Download Close prices (CSV)",
-            data=close_csv,
-            file_name="nifty50_top10_close_prices.csv",
-            mime="text/csv"
-        )
-
-        with st.expander("View downloaded Close-price data"):
-            st.dataframe(close.tail(10), use_container_width=True)
-
-        st.caption(
-            "Data note: Yahoo Finance may revise or omit historical observations. "
-            "The app uses the unadjusted Close field only, not Adj Close, dividends, "
-            "or corporate-action-adjusted total returns. Results therefore represent "
-            "price-only returns and may differ from total-return portfolio performance."
-        )
-        st.caption(
-            "Selection-bias note: the default universe is based on Nifty 50 index weights "
-            "as of Sep-2026 and is applied retrospectively to Jan-2025. This introduces "
-            "look-ahead/survivorship bias. For a fully point-in-time study, use the "
-            "constituents that were known at the start of the training period."
-        )
-
+        st.success("Optimisation and out-of-sample backtest completed successfully.")
     except Exception as exc:
         st.error(f"Unable to complete the analysis: {exc}")
-        st.info(
-            "Check your internet connection and Yahoo Finance ticker symbols. "
-            "If a ticker has a recent listing or missing prices, replace it with "
-            "another stock having a complete history for the selected period."
-        )
+        st.exception(exc)
+
+# ------------------------------------------------------------
+# RESULTS: DISPLAY FROM SESSION STATE (PERSISTS ON DOWNLOAD)
+# ------------------------------------------------------------
+results = st.session_state.get("portfolio_results")
+if results:
+    st.markdown("## Results summary")
+    a, b, c, d = st.columns(4)
+    a.metric("Stocks analysed", results["stocks"])
+    b.metric("Training observations", results["train_obs"])
+    c.metric("Testing observations", results["test_obs"])
+    d.metric("Testing period", f"{results['testing_start']:%d %b %Y} – {results['testing_end']:%d %b %Y}")
+
+    st.markdown("### Portfolio performance comparison")
+    metric_view = results["metrics_df"].copy()
+    for col in metric_view.columns:
+        if col == "Sharpe Ratio":
+            metric_view[col] = metric_view[col].map(lambda x: f"{x:.3f}" if pd.notna(x) else "N/A")
+        else:
+            metric_view[col] = metric_view[col].map(as_percent)
+    st.dataframe(metric_view, use_container_width=True)
+
+    sharpe_values = results["metrics_df"]["Sharpe Ratio"]
+    if sharpe_values.notna().any():
+        best = sharpe_values.idxmax()
+        st.info(f"Higher test-period Sharpe ratio: **{best}** ({sharpe_values[best]:.3f}). A higher value indicates more historical excess return per unit of realised risk during this test period.")
+
+    st.markdown("### Portfolio allocation")
+    left, right = st.columns(2)
+    with left:
+        fig_mvp = px.pie(results["allocation_df"], names="Company", values="MVP Weight", hole=0.30, title="MVP portfolio weights")
+        fig_mvp.update_traces(textposition="inside", textinfo="label+percent")
+        st.plotly_chart(fig_mvp, use_container_width=True)
+    with right:
+        fig_hrp = px.pie(results["allocation_df"], names="Company", values="HRP Weight", hole=0.30, title="HRP portfolio weights")
+        fig_hrp.update_traces(textposition="inside", textinfo="label+percent")
+        st.plotly_chart(fig_hrp, use_container_width=True)
+
+    allocation_view = results["allocation_df"][["Company", "Ticker", "MVP Allocation (%)", "HRP Allocation (%)"]].copy()
+    allocation_view["MVP Allocation (%)"] = allocation_view["MVP Allocation (%)"].map(lambda x: f"{x:.2f}%")
+    allocation_view["HRP Allocation (%)"] = allocation_view["HRP Allocation (%)"].map(lambda x: f"{x:.2f}%")
+    st.dataframe(allocation_view, use_container_width=True)
+
+    st.markdown("### Portfolio growth during the testing period")
+    growth_fig = go.Figure()
+    growth_fig.add_trace(go.Scatter(x=results["wealth_df"].index, y=results["wealth_df"]["MVP"], mode="lines", name="MVP"))
+    growth_fig.add_trace(go.Scatter(x=results["wealth_df"].index, y=results["wealth_df"]["HRP"], mode="lines", name="HRP"))
+    growth_fig.update_layout(xaxis_title="Date", yaxis_title="Growth of ₹1", hovermode="x unified")
+    st.plotly_chart(growth_fig, use_container_width=True)
+
+    st.markdown("### Portfolio drawdown")
+    dd_fig = go.Figure()
+    dd_fig.add_trace(go.Scatter(x=results["drawdown_df"].index, y=results["drawdown_df"]["MVP"], mode="lines", name="MVP", fill="tozeroy"))
+    dd_fig.add_trace(go.Scatter(x=results["drawdown_df"].index, y=results["drawdown_df"]["HRP"], mode="lines", name="HRP", fill="tozeroy"))
+    dd_fig.update_layout(xaxis_title="Date", yaxis_title="Drawdown", yaxis_tickformat=".1%", hovermode="x unified")
+    st.plotly_chart(dd_fig, use_container_width=True)
+
+    st.markdown("### Training-period correlation matrix")
+    corr_fig = px.imshow(results["correlation"], text_auto=".2f", aspect="auto", color_continuous_scale="RdBu", zmin=-1, zmax=1, title="Correlation of daily Close-to-Close returns")
+    st.plotly_chart(corr_fig, use_container_width=True)
+
+    st.markdown("### Download Results")
+    weights_csv = results["allocation_df"].to_csv(index=False).encode("utf-8")
+    backtest_csv = results["backtest_df"].to_csv(index=False).encode("utf-8")
+    daily_csv = results["daily_df"].to_csv(index=True).encode("utf-8")
+    prices_csv = results["close_prices"].to_csv(index=True).encode("utf-8")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button("Download Portfolio Weights", data=weights_csv, file_name="nifty50_mvp_hrp_portfolio_weights.csv", mime="text/csv", use_container_width=True)
+    with d2:
+        st.download_button("Download Backtesting Results", data=backtest_csv, file_name="nifty50_mvp_hrp_backtesting_results.csv", mime="text/csv", use_container_width=True)
+    d3, d4 = st.columns(2)
+    with d3:
+        st.download_button("Download Daily Portfolio Returns", data=daily_csv, file_name="nifty50_mvp_hrp_daily_returns.csv", mime="text/csv", use_container_width=True)
+    with d4:
+        st.download_button("Download Close Prices", data=prices_csv, file_name="nifty50_top10_close_prices.csv", mime="text/csv", use_container_width=True)
+
+    with st.expander("Methodology and assumptions"):
+        st.markdown("""
+        **Minimum Variance Portfolio (MVP):** Long-only optimisation that minimises training-period portfolio variance. Weights are constrained between 0% and 100% and sum to 100%.
+
+        **Hierarchical Risk Parity (HRP):** Converts the training-period correlation matrix into a distance matrix, applies hierarchical clustering and recursively allocates weights based on cluster variance.
+
+        **Backtesting:** Portfolio weights are estimated using training-period returns and held fixed during the separate testing period. Daily returns are calculated from raw Close prices only. Dividends are excluded because Adjusted Close is not used.
+
+        **Risk and return:** Annualised volatility uses daily standard deviation × √252. Sharpe ratio uses the annual risk-free-rate assumption entered in the sidebar. No transaction costs, taxes or slippage are included. Historical performance does not guarantee future results.
+        """)
+else:
+    st.markdown("### Download Results")
+    st.caption("Run the portfolio optimisation to generate the downloadable portfolio weights and backtesting results.")
+    st.markdown("The dashboard will show the performance comparison, portfolio allocations, charts and downloadable CSV files after the analysis completes.")
