@@ -148,11 +148,11 @@ def get_quasi_diag(link):
 def get_cluster_variance(covariance, cluster_items):
     """Inverse-variance portfolio variance for a cluster."""
     cov_slice = covariance.loc[cluster_items, cluster_items]
-    diagonal = np.diag(cov_slice.values)
+    diagonal = np.diag(cov_slice.to_numpy(copy=True))
     diagonal = np.where(diagonal <= 0, 1e-12, diagonal)
     inv_variance = 1 / diagonal
     weights = inv_variance / inv_variance.sum()
-    return float(weights @ cov_slice.values @ weights)
+    return float(weights @ cov_slice.to_numpy(copy=True) @ weights)
 
 
 def calculate_hrp(train_returns):
@@ -167,9 +167,12 @@ def calculate_hrp(train_returns):
     correlation = train_returns.corr().clip(-1, 1)
 
     distance = np.sqrt((1 - correlation) / 2)
-    np.fill_diagonal(distance.values, 0)
 
-    condensed_distance = squareform(distance.values, checks=False)
+    # Work on a writable NumPy copy; pandas/NumPy may expose read-only views.
+    distance_values = distance.to_numpy(copy=True)
+    np.fill_diagonal(distance_values, 0.0)
+
+    condensed_distance = squareform(distance_values, checks=False)
     linkage_matrix = linkage(
         condensed_distance,
         method="single",
@@ -196,7 +199,11 @@ def calculate_hrp(train_returns):
             right_variance = get_cluster_variance(covariance, right)
 
             # Allocate more weight to the lower-variance cluster.
-            left_weight = 1 - left_variance / (left_variance + right_variance)
+            total_variance = left_variance + right_variance
+            if total_variance <= 0:
+                left_weight = 0.5
+            else:
+                left_weight = 1 - left_variance / total_variance
 
             weights[left] *= left_weight
             weights[right] *= (1 - left_weight)
@@ -207,7 +214,12 @@ def calculate_hrp(train_returns):
 
     weights = weights.reindex(train_returns.columns).fillna(0)
     weights[weights < 1e-10] = 0
-    return weights / weights.sum(), linkage_matrix, correlation
+
+    weight_total = weights.sum()
+    if not np.isfinite(weight_total) or weight_total <= 0:
+        raise ValueError("HRP could not produce valid portfolio weights.")
+
+    return weights / weight_total, linkage_matrix, correlation
 
 
 # ------------------------------------------------------------
